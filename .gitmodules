@@ -1,0 +1,3 @@
+[submodule "metadata_utils"]
+	path = metadata_utils
+	url = git@github.com:Matthewjsiv/metadata_utils.git
