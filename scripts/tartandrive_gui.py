@@ -13,6 +13,8 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg, NavigationToolbar2Tk)
 from tkinter.scrolledtext import ScrolledText
 from tqdm import tqdm
+from rasterio.transform import rowcol
+
 
 
 plt.rcParams['image.interpolation'] = 'None'
@@ -152,7 +154,10 @@ def display_image_and_plot(directory):
         points_obj.release_conn()
         t_odom = np.load(points_path)
 
-        row,col = _dat.index(-t_odom[:,1], t_odom[:,0])
+        try:
+            row,col = _dat.index(-t_odom[:,1], t_odom[:,0])
+        except:
+            row, col = rowcol(_dat.transform, -t_odom[:,1], t_odom[:,0])
         row = np.array(row).astype(float)
         col = np.array(col).astype(float)
         row *= _scale
