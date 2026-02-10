@@ -1,7 +1,5 @@
 import tkinter as tk
 from tkinter import messagebox, filedialog
-from minio import Minio
-from minio.error import S3Error
 import yaml
 import os
 import numpy as np
@@ -15,7 +13,10 @@ from tkinter.scrolledtext import ScrolledText
 from tqdm import tqdm
 from rasterio.transform import rowcol
 
-
+import boto3
+from botocore import UNSIGNED
+from botocore.client import Config
+from os.path import isfile, join
 
 plt.rcParams['image.interpolation'] = 'None'
 
@@ -32,15 +33,61 @@ with open("./assets/files.yaml") as stream:
 
 KITTI_FILE_MAP = FILE_MAP['kitti']
 
+class AirLabDownloader(object):
+    def __init__(self, bucket_name = 'tartandrive2') -> None:
+
+        endpoint_url = "https://airlab-cloud.andrew.cmu.edu:8080/swift/v1/AUTH_ac8533a83cff4d48bc8c608ad222d330"
+
+        self.client = boto3.client("s3", endpoint_url=endpoint_url, config=Config(signature_version=UNSIGNED))
+        self.bucket_name = bucket_name
+
+    def download(self, filename, output_name):
+        success_source_files, success_target_files = [], []
+
+        target_file_name = output_name
+        source_file_name = filename
+        import os
+        from pathlib import Path
+        target_dir = os.path.dirname(target_file_name)
+        print(target_dir)
+        # if not os.path.exists(target_dir):
+            # make recursive directory
+            # os.makedirs(target_dir)
+        # if isfile(target_file_name):
+        #     print_error('Error: Target file {} already exists..'.format(target_file_name))
+        #     continue
+        #     # return False, success_source_files, success_target_files
+
+        print(f"  Downloading {source_file_name} from {self.bucket_name}...")
+        try:
+            resp = self.client.get_object(Bucket=self.bucket_name, Key=source_file_name)
+
+            path = Path(target_file_name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(target_file_name, "wb") as f:
+                for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        except Exception as e:
+            print(f"Error: Failed to download {source_file_name} due to {e}.")
+            return False, success_source_files, success_target_files
+
+        print(f"  Successfully downloaded {source_file_name} to {target_file_name}!")
+
+        return True, success_source_files, success_target_files
+
+
 # Function to get the metadata from the YAML file
 def get_metadata(bucket_name, directory):
     try:
-        metadata_obj = minio_client.get_object(bucket_name, f"bags/{directory}/info.yaml")
-        metadata = yaml.safe_load(metadata_obj)
-        metadata_obj.release_conn()
+        downloader.download(f"bags/{directory}/info.yaml", 'temp_metadata.yaml')
+        with open('temp_metadata.yaml', 'r') as file:
+            metadata = yaml.safe_load(file)
+
         return metadata.get('duration'), metadata.get('top_speed')
-    except S3Error as e:
-        messagebox.showerror("Error", f"Could not retrieve metadata: {e}")
+    except:
+        messagebox.showerror("Error", f"Could not retrieve metadata")
         return None, None
 
 # Function to list directories in the bucket
@@ -69,23 +116,22 @@ def list_items(bucket_name, prefix):
 
 # Function to download selected directory
 def download_directory(bucket_name, directory, save_path, type):
-    # minio_client.fget_object(bucket_name, directory, save_path)]
 
     if '.' in directory.split('/')[-1]:  #probably a file
         # print("Saving " + directory + " to " + save_path)
-        minio_client.fget_object(bucket_name, directory, save_path)
+        downloader.download(directory, save_path)
     else: # directory, for now assuming only one level of depth
         if type == 'bags':
             i_bags = tqdm(FILE_MAP[type][directory + '/']['files'])
             for file in i_bags:
                 i_bags.set_description("Downloading " + file)
                 f_save_path = save_path + '/' + file.split('/')[-1]
-                minio_client.fget_object(bucket_name, file, f_save_path)
+                downloader.download(file, f_save_path)
                 # print("Saving " + file + " to " + f_save_path)
         else:
             for file in FILE_MAP[type]['/'.join(directory.split('/')[:-2]) + '/'][directory]['files']:
                 f_save_path = save_path + file.split('/')[-1]
-                minio_client.fget_object(bucket_name, file, f_save_path)
+                downloader.download(file, f_save_path)
                 # print("Saving " + file + " to " + f_save_path)
 
     # print(FILE_MAP[save_path])
@@ -146,12 +192,8 @@ def repopulate_checkboxes(directory):
 def display_image_and_plot(directory):
     try:
         plt.clf()
-        points_obj = minio_client.get_object(bucket_name, f"bags/{directory}/gps.npy")
-        points_path = os.path.join("temp_pts.npy")
-        with open(points_path, 'wb') as f:
-            for data in points_obj.stream(32*1024):
-                f.write(data)
-        points_obj.release_conn()
+        points_path = os.path.join("temp_pts.npy")        
+        downloader.download(f"bags/{directory}/gps.npy", points_path)
         t_odom = np.load(points_path)
 
         try:
@@ -243,15 +285,9 @@ def deselect_all():
     for var in kitti_vars.values():
         var.set(0)
 
-# Minio client configuration
-access_key = "nFNreHkFY2ca56vIHVaU"
-secret_key = "IHnkXfe30TjJxkVpF8LuP8wQ7kWoMRrb5QpwcK7Z"
-endpoint_url = "airlab-share-02.andrew.cmu.edu:9000"
-
-minio_client = Minio(endpoint_url, access_key=access_key, secret_key=secret_key,secure=True, cert_check=False)
-
 # Bucket name
 bucket_name = 'tartandrive2'
+downloader = AirLabDownloader(bucket_name=bucket_name)
 
 # Create main window
 root = tk.Tk()
