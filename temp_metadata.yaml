@@ -4,25 +4,29 @@ algz:
 - lidar_mapping
 - roughness_cost
 - lidar_stitching
-average_speed: 5.2178012596012096
+average_speed: 5.087797426400795
 data_folder: /home/yamaha/rosbags
-date: gupta
-duration: 172.64479
+date: 2023-09-13-19-12-49
+duration: 103.848099
 experiment_name: tartandrive
 pre:
   conditions:
-  - afternoon
-  - sunny
+  - evening
+  - sunset
+  - dry
   context:
   - collect
   course:
-  - gupta
-  driver: Wenshan
-  launch: {}
+  - turnpike
+  driver: Matthew
+  launch:
+    joystick_drive:
+      args: null
   number_people: 2
   other:
     live_notes: null
     record: null
+    topics_monitor: null
   robot: yamaha_viking
 sensors:
 - velodyne_2
@@ -30,4 +34,4 @@ sensors:
 - racepak
 - novatel
 - velodyne_1
-top_speed: 9.302992851447387
+top_speed: 8.896639620357934
