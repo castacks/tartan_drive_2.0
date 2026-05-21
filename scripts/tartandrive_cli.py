@@ -132,6 +132,19 @@ def get_kitti_items(file_map: dict, directory: str) -> dict:
             result[mod_name] = v.get('files', [])
     return result
 
+def get_all_kitti_modalities(file_map: dict) -> tuple[list[str], list[str]]:
+    """Return (sorted modalities, sorted top-level file stems) across all kitti datasets."""
+    all_mods: set[str] = set()
+    all_tops: set[str] = set()
+    for entry in file_map['kitti'].values():
+        for k, v in entry.items():
+            if k == 'files':
+                for f in v:
+                    all_tops.add(Path(f).stem)
+            else:
+                all_mods.add(k.rstrip('/').split('/')[-1])
+    return sorted(all_mods), sorted(all_tops)
+
 def fetch_metadata(downloader: AirLabDownloader, directory: str) -> dict:
     with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as tmp:
         tmp_path = tmp.name
@@ -303,13 +316,15 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
     print_header()
 
     # Persistent state across the loop
-    dtype:       str | None       = None
-    datasets:    list[str]        = []
-    all_meta:    dict[str, dict]  = {}
-    meta_for:    str | None       = None   # dtype for which all_meta was fetched
-    chosen:      str | None       = None
-    files_to_dl: list[str]        = []
-    dest:        str | None       = None
+    dtype:         str | None       = None
+    datasets:      list[str]        = []
+    all_meta:      dict[str, dict]  = {}
+    meta_for:      str | None       = None   # dtype for which all_meta was fetched
+    chosen:        str | None       = None
+    files_to_dl:   list[str]        = []
+    dest:          str | None       = None
+    bm_modalities: list[str]        = []     # kitti_bm: selected channels/files
+    bm_datasets:   list[str]        = []     # kitti_bm: selected experiments
 
     state = "TYPE"
 
@@ -319,13 +334,19 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
         if state == "TYPE":
             dtype = questionary.select(
                 "Dataset type?",
-                choices=["rosbags", "kitti"],
+                choices=[
+                    questionary.Choice("rosbags",               value="rosbags"),
+                    questionary.Choice("kitti — by experiment", value="kitti"),
+                    questionary.Choice("kitti — by modality",   value="kitti_bm"),
+                ],
                 style=TUI_STYLE,
             ).ask()
             if dtype is None:       # Ctrl+C → quit
                 return
             chosen = files_to_dl = dest = None
-            state = "DATASET"
+            bm_modalities = []
+            bm_datasets = []
+            state = "MODALITY_PICK" if dtype == "kitti_bm" else "DATASET"
 
         # ── DATASET ───────────────────────────────────────────────────────────
         elif state == "DATASET":
@@ -341,22 +362,12 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
                 console.print(bags_table(datasets, file_map, all_meta))
                 console.print()
 
-                col_w   = max(len(d) for d in datasets)
-                choices = [questionary.Choice("← Back", value="__back__")] + [
-                    questionary.Choice(
-                        title=(
-                            f"{d:<{col_w}}  "
-                            f"{fmt_duration(all_meta.get(d, {}).get('duration')):>8}  "
-                            f"{fmt_speed(all_meta.get(d, {}).get('top_speed')):>10}"
-                        ),
-                        value=d,
-                    )
-                    for d in datasets
-                ]
-                chosen = questionary.select(
-                    "Select dataset  (↑↓ · Enter = confirm):",
-                    choices=choices,
+                chosen = questionary.autocomplete(
+                    "Search dataset  (type to filter · Tab = complete · Enter = confirm · Ctrl+C = back):",
+                    choices=datasets,
                     style=TUI_STYLE,
+                    validate=lambda x: x in datasets or "Please select a valid dataset name",
+                    match_middle=True,
                 ).ask()
 
             else:   # kitti — metadata lives in the bags/ folder, same names
@@ -370,24 +381,15 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
                 console.print(kitti_table(datasets, file_map, all_meta))
                 console.print()
 
-                choices = [questionary.Choice("← Back", value="__back__")] + [
-                    questionary.Choice(
-                        title=(
-                            f"{d}  "
-                            f"[{fmt_duration(all_meta.get(d, {}).get('duration'))}"
-                            f" · {fmt_speed(all_meta.get(d, {}).get('top_speed'))}]"
-                        ),
-                        value=d,
-                    )
-                    for d in datasets
-                ]
-                chosen = questionary.select(
-                    "Select dataset  (↑↓ · Enter = confirm):",
-                    choices=choices,
+                chosen = questionary.autocomplete(
+                    "Search dataset  (type to filter · Tab = complete · Enter = confirm · Ctrl+C = back):",
+                    choices=datasets,
                     style=TUI_STYLE,
+                    validate=lambda x: x in datasets or "Please select a valid dataset name",
+                    match_middle=True,
                 ).ask()
 
-            if chosen is None or chosen == "__back__":
+            if chosen is None:
                 state = "TYPE"
                 continue
 
@@ -405,6 +407,87 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
                 else []
             )
             state = "MODALITIES" if dtype == "kitti" else "DEST"
+
+        # ── MODALITY_PICK (kitti_bm: pick channels first) ─────────────────────
+        elif state == "MODALITY_PICK":
+            all_mods, all_tops = get_all_kitti_modalities(file_map)
+
+            mt = Table(box=box.SIMPLE_HEAD, border_style="dim", header_style="bold cyan",
+                       show_edge=False, title="[bold]Available channels & files[/bold]",
+                       title_justify="left")
+            mt.add_column("Name",  style="white")
+            mt.add_column("Type",  style="dim")
+            for m in all_mods:
+                mt.add_row(m, "modality")
+            for s in all_tops:
+                mt.add_row(s, "tar / file")
+            console.print(mt)
+            console.print()
+
+            mod_choices = [
+                questionary.Choice(item, checked=(item in bm_modalities))
+                for item in all_mods + all_tops
+            ]
+            selected = questionary.checkbox(
+                "Select channels/files  (Space = toggle · a = all · Enter = confirm · Ctrl+C = back):",
+                choices=mod_choices,
+                style=TUI_STYLE,
+            ).ask()
+
+            if selected is None:
+                state = "TYPE"
+                continue
+            if not selected:
+                console.print("[yellow]No channel selected — pick at least one.[/yellow]\n")
+                continue
+
+            bm_modalities = selected
+            state = "DATASET_MULTI"
+
+        # ── DATASET_MULTI (kitti_bm: pick experiments) ─────────────────────────
+        elif state == "DATASET_MULTI":
+            console.print()
+            datasets = list_kitti(file_map)
+            if meta_for != "kitti":
+                with console.status(
+                    f"[dim]Loading metadata for {len(datasets)} datasets…[/dim]"
+                ):
+                    all_meta = fetch_all_metadata(downloader, datasets)
+                meta_for = "kitti"
+            console.print(kitti_table(datasets, file_map, all_meta))
+            console.print()
+
+            ds_choices = [
+                questionary.Choice(d, checked=(d in bm_datasets))
+                for d in datasets
+            ]
+            selected_ds = questionary.checkbox(
+                "Select experiments  (Space = toggle · a = all · Enter = confirm · Ctrl+C = back):",
+                choices=ds_choices,
+                style=TUI_STYLE,
+            ).ask()
+
+            if selected_ds is None:
+                state = "MODALITY_PICK"
+                continue
+            if not selected_ds:
+                console.print("[yellow]No experiment selected — pick at least one.[/yellow]\n")
+                continue
+
+            bm_datasets = selected_ds
+
+            # Build flat file list from selected datasets × selected modalities
+            files_to_dl = []
+            for ds in bm_datasets:
+                items = get_kitti_items(file_map, ds)
+                ds_items: dict[str, list[str]] = {
+                    Path(f).stem: [f] for f in items.get('__top__', [])
+                }
+                ds_items.update({k: v for k, v in items.items() if not k.startswith('__')})
+                for mod in bm_modalities:
+                    files_to_dl.extend(ds_items.get(mod, []))
+
+            state = "DEST"
 
         # ── MODALITIES (kitti only) ────────────────────────────────────────────
         elif state == "MODALITIES":
@@ -456,7 +539,7 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
         # ── DEST ──────────────────────────────────────────────────────────────
         elif state == "DEST":
             console.print()
-            default_dest = str(Path.home() / "tartandrive_data" / chosen)
+            default_dest = str(Path.home() / "tartandrive_data" / (chosen or "kitti_selection"))
             dest = questionary.path(
                 "Destination folder  (Tab = autocomplete · Ctrl+C = back):",
                 default=dest or default_dest,
@@ -465,7 +548,12 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
             ).ask()
 
             if dest is None:        # Ctrl+C → back
-                state = "MODALITIES" if dtype == "kitti" else "DATASET"
+                if dtype == "kitti_bm":
+                    state = "DATASET_MULTI"
+                elif dtype == "kitti":
+                    state = "MODALITIES"
+                else:
+                    state = "DATASET"
                 continue
             dest = os.path.expanduser(dest)
             state = "CONFIRM"
@@ -482,7 +570,9 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
                     questionary.Choice("✓  Start download",      value="go"),
                     questionary.Choice("←  Change destination",  value="dest"),
                     questionary.Choice(
-                        "←  Change modalities" if dtype == "kitti" else "←  Change dataset",
+                        "←  Change experiments" if dtype == "kitti_bm"
+                        else "←  Change modalities" if dtype == "kitti"
+                        else "←  Change dataset",
                         value="back",
                     ),
                     questionary.Choice("✕  Cancel",              value="cancel"),
@@ -496,10 +586,16 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
             elif action == "dest":
                 state = "DEST"
             elif action == "back":
-                state = "MODALITIES" if dtype == "kitti" else "DATASET"
+                if dtype == "kitti_bm":
+                    state = "DATASET_MULTI"
+                elif dtype == "kitti":
+                    state = "MODALITIES"
+                else:
+                    state = "DATASET"
             else:
                 console.print()
-                run_download(downloader, files_to_dl, dest, dtype)
+                run_download(downloader, files_to_dl, dest,
+                            "kitti" if dtype == "kitti_bm" else dtype)
                 return
 
 # ── CLI sub-commands ───────────────────────────────────────────────────────────
