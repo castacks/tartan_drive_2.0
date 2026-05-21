@@ -40,6 +40,73 @@ ENDPOINT_URL = "https://airlab-cloud.andrew.cmu.edu:8080/swift/v1/AUTH_ac8533a83
 ASSETS_DIR   = Path(__file__).parent.parent / "assets"
 FILES_YAML   = ASSETS_DIR / "files.yaml"
 
+CONFIG_PATH = Path.home() / ".tartandrive" / "config.yaml"
+MAX_WORKERS = 32
+DEFAULT_CONFIG: dict = {
+    "download": {
+        "workers":      8,
+        "chunk_size_mb": 1,
+    }
+}
+
+# ── Config helpers ─────────────────────────────────────────────────────────────
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = base.copy()
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False)
+        return _deep_merge({}, DEFAULT_CONFIG)
+    with open(CONFIG_PATH) as f:
+        on_disk = yaml.safe_load(f) or {}
+    return _deep_merge(DEFAULT_CONFIG, on_disk)
+
+def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+
+def _get_nested(cfg: dict, key: str):
+    val = cfg
+    for part in key.split("."):
+        if not isinstance(val, dict) or part not in val:
+            return None
+        val = val[part]
+    return val
+
+def _set_nested(cfg: dict, key: str, raw: str):
+    for cast in (int, float):
+        try:
+            value = cast(raw)
+            break
+        except ValueError:
+            pass
+    else:
+        value = raw
+    parts = key.split(".")
+    d = cfg
+    for part in parts[:-1]:
+        d = d.setdefault(part, {})
+    d[parts[-1]] = value
+    return value
+
+def _flatten(d: dict, prefix: str = ""):
+    for k, v in d.items():
+        full = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            yield from _flatten(v, full)
+        else:
+            yield full, v
+
 console = Console()
 
 TUI_STYLE = Style([
@@ -62,13 +129,19 @@ BANNER = """\
 # ── Downloader ─────────────────────────────────────────────────────────────────
 
 class AirLabDownloader:
-    def __init__(self, bucket_name: str = BUCKET_NAME):
+    def __init__(self, bucket_name: str = BUCKET_NAME,
+                 workers: int = DEFAULT_CONFIG["download"]["workers"],
+                 chunk_size_mb: int = DEFAULT_CONFIG["download"]["chunk_size_mb"]):
         self.client = boto3.client(
             "s3",
             endpoint_url=ENDPOINT_URL,
-            config=Config(signature_version=UNSIGNED),
+            config=Config(
+                signature_version=UNSIGNED,
+                max_pool_connections=max(workers, 10),
+            ),
         )
         self.bucket_name = bucket_name
+        self.chunk_size  = chunk_size_mb * 1024 * 1024
 
     def download(self, source: str, dest: str,
                  progress: Progress | None = None,
@@ -83,7 +156,7 @@ class AirLabDownloader:
                 progress.update(task_id, total=total)
 
             with open(dest, "wb") as f:
-                for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
+                for chunk in resp["Body"].iter_chunks(chunk_size=self.chunk_size):
                     if chunk:
                         f.write(chunk)
                         if progress and task_id is not None:
@@ -93,12 +166,22 @@ class AirLabDownloader:
             console.print(f"  [red]Error:[/red] {source.split('/')[-1]} — {e}")
             return False
 
+    def is_complete(self, source: str, dest: str) -> bool:
+        local = Path(dest)
+        if not local.exists():
+            return False
+        try:
+            head = self.client.head_object(Bucket=self.bucket_name, Key=source)
+            return local.stat().st_size == int(head["ContentLength"])
+        except Exception:
+            return False
+
     def download_silent(self, source: str, dest: str) -> bool:
         try:
             resp = self.client.get_object(Bucket=self.bucket_name, Key=source)
             Path(dest).parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as f:
-                for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
+                for chunk in resp["Body"].iter_chunks(chunk_size=self.chunk_size):
                     if chunk:
                         f.write(chunk)
             return True
@@ -277,8 +360,8 @@ def summary_panel(files: list[str], dest: str) -> Panel:
 # ── Download runner ────────────────────────────────────────────────────────────
 
 def run_download(downloader: AirLabDownloader, files: list[str],
-                 dest: str, dataset_type: str):
-    ok = failed = 0
+                 dest: str, dataset_type: str, workers: int = DEFAULT_CONFIG["download"]["workers"]):
+    ok = failed = skipped = 0
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold]{task.description}"),
@@ -290,29 +373,45 @@ def run_download(downloader: AirLabDownloader, files: list[str],
         transient=False,
     ) as progress:
         overall = progress.add_task("[cyan]Overall", total=len(files))
-        for source in files:
-            name = source.split('/')[-1]
-            task = progress.add_task(f"[green]{name}", total=None)
+
+        def _dl(source: str) -> str:
             dest_path = local_path(source, dest, dataset_type)
-            if downloader.download(source, dest_path, progress, task):
-                ok += 1
-            else:
-                failed += 1
-            progress.update(overall, advance=1)
+            name = source.split('/')[-1]
+            if downloader.is_complete(source, dest_path):
+                progress.console.print(f"  [dim]↩ skip  {name}[/dim]")
+                return "skip"
+            task = progress.add_task(f"[green]{name}", total=None)
+            result = downloader.download(source, dest_path, progress, task)
             progress.remove_task(task)
+            return "ok" if result else "fail"
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_dl, src): src for src in files}
+            for future in as_completed(futures):
+                status = future.result()
+                if status == "ok":
+                    ok += 1
+                elif status == "skip":
+                    skipped += 1
+                else:
+                    failed += 1
+                progress.advance(overall, 1)
 
     console.print()
-    if failed == 0:
-        console.print(f"[bold green]Done![/bold green]  {ok} files → [cyan]{dest}[/cyan]")
-    else:
-        console.print(
-            f"[yellow]Finished with errors:[/yellow] "
-            f"{ok} ok, [red]{failed} failed[/red] → [cyan]{dest}[/cyan]"
-        )
+    parts = []
+    if ok:
+        parts.append(f"[green]{ok} downloaded[/green]")
+    if skipped:
+        parts.append(f"[dim]{skipped} skipped[/dim]")
+    if failed:
+        parts.append(f"[red]{failed} failed[/red]")
+    status_line = ", ".join(parts)
+    prefix = "[bold green]Done![/bold green]" if not failed else "[yellow]Finished with errors:[/yellow]"
+    console.print(f"{prefix}  {status_line}  → [cyan]{dest}[/cyan]")
 
 # ── Interactive TUI ────────────────────────────────────────────────────────────
 
-def interactive(file_map: dict, downloader: AirLabDownloader):
+def interactive(file_map: dict, downloader: AirLabDownloader, workers: int = DEFAULT_CONFIG["download"]["workers"]):
     print_header()
 
     # Persistent state across the loop
@@ -595,10 +694,42 @@ def interactive(file_map: dict, downloader: AirLabDownloader):
             else:
                 console.print()
                 run_download(downloader, files_to_dl, dest,
-                            "kitti" if dtype == "kitti_bm" else dtype)
+                            "kitti" if dtype == "kitti_bm" else dtype, workers)
                 return
 
 # ── CLI sub-commands ───────────────────────────────────────────────────────────
+
+def cmd_config(action: str, key: str | None, raw_value: str | None):
+    cfg = load_config()
+    if action == "show" or (action is None):
+        t = Table(box=box.SIMPLE_HEAD, border_style="dim", header_style="bold cyan",
+                  show_edge=False)
+        t.add_column("Key",     style="white")
+        t.add_column("Value",   style="cyan")
+        t.add_column("Default", style="dim")
+        for k, v in _flatten(cfg):
+            default = _get_nested(DEFAULT_CONFIG, k)
+            marker = " [yellow]*[/yellow]" if v != default else ""
+            t.add_row(k, f"{v}{marker}", str(default))
+        console.print(Panel(t,
+            title=f"[bold]Config[/bold]  [dim]{CONFIG_PATH}[/dim]",
+            border_style="dim cyan"))
+
+    elif action == "get":
+        val = _get_nested(cfg, key)
+        if val is None:
+            console.print(f"[red]Unknown key:[/red] {key}")
+            sys.exit(1)
+        console.print(f"{key} = [cyan]{val}[/cyan]")
+
+    elif action == "set":
+        value = _set_nested(cfg, key, raw_value)
+        if key == "download.workers":
+            value = max(1, min(int(value), MAX_WORKERS))
+            _set_nested(cfg, key, str(value))
+        save_config(cfg)
+        console.print(f"[green]Set[/green] {key} = [cyan]{value}[/cyan]  "
+                      f"[dim](saved to {CONFIG_PATH})[/dim]")
 
 def cmd_list(file_map: dict, dtype: str | None):
     if dtype in (None, 'bags', 'rosbags'):
@@ -635,12 +766,11 @@ def cmd_info(file_map: dict, downloader: AirLabDownloader,
 
 def cmd_download(file_map: dict, downloader: AirLabDownloader,
                  dataset: str, dtype: str, output: str,
-                 modalities: list[str] | None):
+                 modalities: list[str] | None, workers: int):
     if dtype in ('bags', 'rosbags'):
         files_to_dl = get_bag_files(file_map, dataset)
     else:
         items = get_kitti_items(file_map, dataset)
-        # Build a flat name→files map (top-level files by stem + sub-dirs)
         all_items: dict[str, list[str]] = {
             Path(f).stem: [f] for f in items.get('__top__', [])
         }
@@ -662,7 +792,7 @@ def cmd_download(file_map: dict, downloader: AirLabDownloader,
     dest = os.path.expanduser(output)
     console.print(summary_panel(files_to_dl, dest))
     console.print()
-    run_download(downloader, files_to_dl, dest, dtype)
+    run_download(downloader, files_to_dl, dest, dtype, workers)
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -704,6 +834,17 @@ examples:
     p_dl.add_argument("-m", "--modalities", nargs="+",
                       metavar="MOD",
                       help="(kitti only) Modalities to download")
+    p_dl.add_argument("--workers", type=int, default=None, metavar="N",
+                      help=f"Parallel download threads 1–{MAX_WORKERS} (overrides config)")
+
+    p_cfg = sub.add_parser("config", help="Read or write config values")
+    cfg_sub = p_cfg.add_subparsers(dest="config_action")
+    cfg_sub.add_parser("show", help="Show all config values")
+    p_cfg_get = cfg_sub.add_parser("get", help="Get a config value")
+    p_cfg_get.add_argument("key", help="Dotted key, e.g. download.workers")
+    p_cfg_set = cfg_sub.add_parser("set", help="Set a config value")
+    p_cfg_set.add_argument("key",   help="Dotted key, e.g. download.workers")
+    p_cfg_set.add_argument("value", help="New value")
 
     return parser
 
@@ -711,8 +852,21 @@ def main():
     parser = build_parser()
     args   = parser.parse_args()
 
+    if args.command == "config":
+        key = getattr(args, "key",   None)
+        val = getattr(args, "value", None)
+        cmd_config(args.config_action, key, val)
+        return
+
+    cfg      = load_config()
+    workers  = cfg["download"]["workers"]
+    chunk_mb = cfg["download"]["chunk_size_mb"]
+
+    if args.command == "download" and args.workers is not None:
+        workers = max(1, min(args.workers, MAX_WORKERS))
+
     file_map   = load_file_map()
-    downloader = AirLabDownloader()
+    downloader = AirLabDownloader(workers=workers, chunk_size_mb=chunk_mb)
 
     if args.command == "list":
         cmd_list(file_map, args.dtype)
@@ -720,9 +874,9 @@ def main():
         cmd_info(file_map, downloader, args.dataset, args.dtype)
     elif args.command == "download":
         cmd_download(file_map, downloader, args.dataset, args.dtype,
-                     args.output, args.modalities)
+                     args.output, args.modalities, workers)
     else:
-        interactive(file_map, downloader)
+        interactive(file_map, downloader, workers)
 
 if __name__ == "__main__":
     main()
