@@ -437,15 +437,76 @@ def interactive(file_map: dict, downloader: AirLabDownloader, workers: int = DEF
                     questionary.Choice("rosbags",               value="rosbags"),
                     questionary.Choice("kitti — by experiment", value="kitti"),
                     questionary.Choice("kitti — by modality",   value="kitti_bm"),
+                    questionary.Separator(),
+                    questionary.Choice("⚙  Advanced settings",  value="settings"),
                 ],
                 style=TUI_STYLE,
             ).ask()
-            if dtype is None:       # Ctrl+C → quit
+            if dtype is None:
                 return
+            if dtype == "settings":
+                state = "SETTINGS"
+                continue
             chosen = files_to_dl = dest = None
             bm_modalities = []
             bm_datasets = []
             state = "MODALITY_PICK" if dtype == "kitti_bm" else "DATASET"
+
+        # ── SETTINGS ──────────────────────────────────────────────────────────
+        elif state == "SETTINGS":
+            cfg     = load_config()
+            dl_cfg  = cfg["download"]
+            console.print()
+            setting_choices = [
+                questionary.Choice(
+                    f"workers        = [bold]{workers}[/bold]  (parallel threads, 1–{MAX_WORKERS})",
+                    value="workers",
+                ),
+                questionary.Choice(
+                    f"chunk_size_mb  = [bold]{dl_cfg['chunk_size_mb']}[/bold]  (MB per read chunk)",
+                    value="chunk_size_mb",
+                ),
+                questionary.Separator(),
+                questionary.Choice("← Back", value="back"),
+            ]
+            key = questionary.select(
+                "Advanced settings  (Enter to edit · Ctrl+C = back):",
+                choices=setting_choices,
+                style=TUI_STYLE,
+            ).ask()
+            if key is None or key == "back":
+                state = "TYPE"
+                continue
+
+            validators = {
+                "workers": lambda x: (
+                    (x.isdigit() and 1 <= int(x) <= MAX_WORKERS)
+                    or f"Enter a number between 1 and {MAX_WORKERS}"
+                ),
+                "chunk_size_mb": lambda x: (
+                    (x.isdigit() and int(x) >= 1)
+                    or "Enter a number >= 1"
+                ),
+            }
+            new_val = questionary.text(
+                f"{key}  (current: {dl_cfg[key]}):",
+                default=str(dl_cfg[key]),
+                validate=validators[key],
+                style=TUI_STYLE,
+            ).ask()
+            if new_val is not None:
+                _set_nested(cfg, f"download.{key}", new_val)
+                save_config(cfg)
+                workers    = cfg["download"]["workers"]
+                downloader = AirLabDownloader(
+                    workers=workers,
+                    chunk_size_mb=cfg["download"]["chunk_size_mb"],
+                )
+                console.print(
+                    f"  [green]Saved[/green] download.{key} = "
+                    f"[cyan]{cfg['download'][key]}[/cyan]  "
+                    f"[dim](→ {CONFIG_PATH})[/dim]\n"
+                )
 
         # ── DATASET ───────────────────────────────────────────────────────────
         elif state == "DATASET":
