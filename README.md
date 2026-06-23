@@ -1,13 +1,51 @@
 # tartan_drive_2.0
 
 
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+```
+
+### Terminal downloader 
+
+Interactive TUI — works locally and over SSH:
+
+```bash
+python3 scripts/tartandrive_cli.py
+```
+
+Navigate with arrow keys, filter datasets by typing, use Tab for path completion, and select KITTI modalities with checkboxes.
+
+Non-interactive commands for scripting:
+
+```bash
+# List all available datasets
+python3 scripts/tartandrive_cli.py list
+python3 scripts/tartandrive_cli.py list --type kitti
+
+# Show files and metadata for a dataset
+python3 scripts/tartandrive_cli.py info <dataset_name>
+python3 scripts/tartandrive_cli.py info <dataset_name> --type kitti
+
+# Download a full rosbag run
+python3 scripts/tartandrive_cli.py download <dataset_name> -o ~/my_data
+
+# Download specific KITTI modalities
+python3 scripts/tartandrive_cli.py download <dataset_name> --type kitti \
+    -o ~/my_data --modalities cmd controls gps_odom image_left
+```
+
+### GUI downloader
+
+```bash
+python3 scripts/tartandrive_gui.py
+```
+
+Click through runs to download rosbags or KITTI-format datasets. You may need to resize the window to see all options.
+
 ## Download Instructions
 Documentation is in progress, but the data is now publicly available!
-To download, run the following command:
-`
-python3 scripts/tartandrive_gui.py
-`
-This will allow you to click through different runs and download either the rosbags, or datasets in a KITTI format. If you only want a few specific modalities, it is suggested to download the dataset form to save space. You might need to expand the size of the gui in order to see all of the options/buttons.
 
 
 
