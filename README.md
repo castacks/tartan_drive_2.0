@@ -7,7 +7,7 @@
 pip install -r requirements.txt
 ```
 
-### Terminal downloader (recommended)
+### Terminal downloader 
 
 Interactive TUI — works locally and over SSH:
 
